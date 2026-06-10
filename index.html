@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Path of Trading — PoE2 Currency Trading Helper</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>Path of Trading</h1>
+    <p class="subtitle">PoE2 currency trading path optimizer</p>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: configuration -->
+    <section class="panel config">
+      <h2>Currency ratios</h2>
+      <form id="ratio-form" class="ratio-form" autocomplete="off">
+        <input
+          id="ratio-input"
+          type="text"
+          placeholder="e.g. 1A -> 20B"
+          aria-label="New ratio"
+        />
+        <button type="submit">Add</button>
+      </form>
+      <p class="hint">Format: <code>1A -&gt; 20B</code> (amount + currency on each side)</p>
+      <p id="ratio-error" class="error" role="alert"></p>
+
+      <p id="connectivity-warning" class="warning" role="status" hidden></p>
+
+      <ul id="ratio-list" class="ratio-list"></ul>
+
+      <div class="config-grid">
+        <div class="field">
+          <label for="start-amount">Starting amount</label>
+          <input id="start-amount" type="number" min="0" step="0.1" value="1" />
+          <p class="hint">Amount of the start currency to simulate trading.</p>
+        </div>
+
+        <div class="field">
+          <label for="start-select">Starting currency</label>
+          <select id="start-select"></select>
+        </div>
+
+        <div class="field">
+          <label>Goal currencies</label>
+          <div id="goal-list" class="goal-list"></div>
+        </div>
+
+        <div class="field">
+          <label for="loops-slider">
+            Allowed loops: <span id="loops-value">0</span>
+          </label>
+          <input id="loops-slider" type="range" min="0" max="4" step="1" value="0" />
+          <p class="hint">Extra node revisits allowed in a path (e.g. A&rarr;B&rarr;A&rarr;C).</p>
+        </div>
+      </div>
+
+      <button id="reset-btn" class="ghost" type="button">Reset to example</button>
+    </section>
+
+    <!-- RIGHT: results -->
+    <section class="panel results">
+      <h2>Best to hold</h2>
+      <div id="hold-ranking" class="hold-ranking"></div>
+
+      <h2>Mispriced trades</h2>
+      <div id="mispriced" class="mispriced"></div>
+
+      <h2>Best paths</h2>
+      <div id="results" class="results-grid"></div>
+
+      <h2>Custom path</h2>
+      <div id="custom-path" class="custom-path"></div>
+
+      <h2>Profitability</h2>
+      <div id="chart-wrap" class="chart-wrap">
+        <svg id="chart"></svg>
+      </div>
+      <div id="chart-legend" class="chart-legend"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
