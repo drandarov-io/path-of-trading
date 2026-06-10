@@ -1,4 +1,10 @@
-# Path of Trading
+# Path of Trading Helper
+
+## Other Projects
+
+- [Path of Hideout](https://github.com/drandarov-io/path-of-hideout) — View and selectively merge PoE hideouts.
+
+## Showcase
 
 ![Path of Trading screenshot](image.png)
 
