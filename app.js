@@ -14,7 +14,7 @@ const EXAMPLE = {
     { fromAmount: 1, fromCur: "DIV", toAmount: 11, baseTo: 11, toCur: "CH" },
     { fromAmount: 1, fromCur: "CH", toAmount: 5, baseTo: 5, toCur: "VAAL" },
     { fromAmount: 1, fromCur: "CH", toAmount: 10, baseTo: 10, toCur: "EX" },
-    { fromAmount: 2.2, fromCur: "EX", toAmount: 1, baseTo: 1, toCur: "VAAL" },
+    { fromAmount: 1, fromCur: "VAAL", toAmount: 2.2, baseTo: 2.2, toCur: "EX" },
   ],
   start: "DIV",
   goals: ["EX", "VAAL"],
@@ -93,7 +93,11 @@ function buildEdges() {
       add(r.fromCur, r.toCur, rate, `${trim(r.fromAmount)}${r.fromCur}\u2192${trim(r.toAmount)}${r.toCur}`);
     }
     if (r.rev !== false) {
-      add(r.toCur, r.fromCur, 1 / rate, `${trim(r.toAmount)}${r.toCur}\u2192${trim(r.fromAmount)}${r.fromCur}`);
+      const hasCustomRev = r.revFromAmount > 0 && r.revToAmount > 0;
+      const revRate = hasCustomRev ? r.revToAmount / r.revFromAmount : 1 / rate;
+      const rfa = hasCustomRev ? r.revFromAmount : r.toAmount;
+      const rta = hasCustomRev ? r.revToAmount : r.fromAmount;
+      add(r.toCur, r.fromCur, revRate, `${trim(rfa)}${r.toCur}\u2192${trim(rta)}${r.fromCur}`);
     }
   }
   return adj;
@@ -141,6 +145,46 @@ function connectivityIssues() {
   return components.slice(1).flat().sort();
 }
 
+/** Returns currency pairs that are only reachable indirectly (no direct ratio entry).
+ * Each entry has { from, to, rate } where rate is the best estimated rate via existing edges. */
+function missingDirectRatios() {
+  const disconnected = new Set(connectivityIssues());
+  const curs = currencies().filter(c => !disconnected.has(c));
+  if (curs.length < 3) return [];
+  const direct = new Set(state.ratios.map(r => [r.fromCur, r.toCur].sort().join("\0")));
+  const adj = buildEdges();
+
+  // BFS best-rate from `src` to all currencies — each node visited once
+  function bestRates(src) {
+    const dist = { [src]: 1 };
+    const visited = new Set([src]);
+    const queue = [src];
+    while (queue.length) {
+      const node = queue.shift();
+      for (const { to, rate } of adj[node] || []) {
+        if (!visited.has(to)) {
+          visited.add(to);
+          dist[to] = dist[node] * rate;
+          queue.push(to);
+        }
+      }
+    }
+    return dist;
+  }
+
+  const missing = [];
+  for (let i = 0; i < curs.length; i++) {
+    for (let j = i + 1; j < curs.length; j++) {
+      if (!direct.has([curs[i], curs[j]].sort().join("\0"))) {
+        const ratesFrom = bestRates(curs[i]);
+        const rate = ratesFrom[curs[j]];
+        missing.push({ from: curs[i], to: curs[j], rate });
+      }
+    }
+  }
+  return missing;
+}
+
 /* ------------------------------------------------------------------ *
  * Pathfinding: max-product walk from start to every reachable currency.
  * `maxLoops` = number of node revisits allowed (budget).
@@ -156,24 +200,33 @@ function bestPaths() {
   const edges = [];
 
   function dfs(node, product, loopsUsed) {
-    if (node !== state.start) {
+    // Record any non-trivial arrival: any currency other than start, and also
+    // start itself when we've taken at least one step (a profitable round-trip).
+    if (node !== state.start || nodes.length > 1) {
       const cur = best[node];
       if (!cur || product > cur.product) {
         best[node] = { product, nodes: [...nodes], edges: [...edges] };
       }
     }
+    // Don't continue past a return to start — the round-trip is complete.
+    if (node === state.start && nodes.length > 1) return;
     if (nodes.length > currencies().length + state.maxLoops + 1) return; // safety
     for (const e of adj[node] || []) {
-      const willRevisit = (visit[e.to] || 0) > 0;
-      const nextLoops = loopsUsed + (willRevisit ? 1 : 0);
-      if (nextLoops > state.maxLoops) continue;
-      visit[e.to] = (visit[e.to] || 0) + 1;
+      const revisitCount = visit[e.to] || 0;
+      // Allow returning to start if it would be the end of a loop (one revisit).
+      const isReturnToStart = e.to === state.start;
+      const willRevisit = revisitCount > 0;
+      const loopCost = willRevisit ? 1 : 0;
+      if (loopsUsed + loopCost > state.maxLoops) continue;
+      // Don't re-enter start mid-path (only as the terminal step).
+      if (isReturnToStart && revisitCount > 0 && edges.length < 1) continue;
+      visit[e.to] = revisitCount + 1;
       nodes.push(e.to);
       edges.push(e);
-      dfs(e.to, product * e.rate, nextLoops);
+      dfs(e.to, product * e.rate, loopsUsed + loopCost);
       nodes.pop();
       edges.pop();
-      visit[e.to] -= 1;
+      visit[e.to] = revisitCount;
     }
   }
 
@@ -240,24 +293,51 @@ function renderRatioList() {
     const li = document.createElement("li");
     li.className = "ratio-item";
     const max = Math.max(r.baseTo * 3, r.toAmount * 1.5, r.baseTo + 1);
+
+    // Reverse-rate: custom if revFromAmount/revToAmount are explicitly set.
+    const hasCustomRev = r.revFromAmount > 0 && r.revToAmount > 0;
+    const revFromAmt = hasCustomRev ? r.revFromAmount : r.toAmount;
+    const revToAmt   = hasCustomRev ? r.revToAmount   : r.fromAmount;
+    const revRate    = revToAmt / revFromAmt;
+    const isCustom   = hasCustomRev && Math.abs(revRate - r.fromAmount / r.toAmount) > 1e-9;
+    const revMax     = Math.max(revFromAmt * 5, r.toAmount * 3, 0.1);
+
+    const canExpand = r.rev !== false;
+    const expandBtn = canExpand
+      ? `<button class="rev-expand-btn${r.revExpanded ? " active" : ""}${isCustom ? " custom" : ""}" data-i="${i}" title="${r.revExpanded ? "Hide reverse rate" : "Customize reverse rate"}" aria-label="Toggle custom reverse rate">&#x21C4;</button>`
+      : "";
+    const revRow = canExpand && r.revExpanded ? `
+      <div class="ratio-rev-row">
+        <input class="amt-edit" type="number" min="0" step="0.1" data-i="${i}" data-side="rev-from" value="${trim(revFromAmt)}" aria-label="Reverse from amount" /><span class="cur">${r.toCur}</span>
+        &rarr;
+        <input class="amt-edit" type="number" min="0" step="0.1" data-i="${i}" data-side="rev-to" value="${trim(revToAmt)}" aria-label="Reverse to amount" /><span class="cur">${r.fromCur}</span>
+        <span class="rev-rate">(${trim(revRate)} per 1 ${r.toCur})</span>
+        ${isCustom ? `<button class="rev-reset" data-i="${i}" title="Reset to inverse rate" aria-label="Reset reverse rate">&#x21BA;</button>` : ""}
+      </div>
+      <div class="ratio-slider-row">
+        <input type="range" class="rev-slider" data-i="${i}" min="0" max="${trim(revMax)}" step="0.1" value="${trim(revFromAmt)}" />
+        <span class="rev-amount">${trim(revFromAmt)} ${r.toCur}</span>
+      </div>` : "";
+
     li.innerHTML = `
       <div class="ratio-head">
         <span class="ratio-label">
           <input class="amt-edit" type="number" min="0" step="0.1" data-i="${i}" data-side="from" value="${trim(r.fromAmount)}" aria-label="From amount" /><span class="cur">${r.fromCur}</span>
           &rarr;
           <input class="amt-edit" type="number" min="0" step="0.1" data-i="${i}" data-side="to" value="${trim(r.toAmount)}" aria-label="To amount" /><span class="cur">${r.toCur}</span>
-          <span class="rate">(${trim(rate)} per 1${r.fromCur})</span>
+          <span class="fwd-rate">(${trim(rate)} per 1 ${r.fromCur})</span>
         </span>
         <span class="ratio-actions">
           <button class="dir-btn ${r.fwd === false ? "off" : "on"}" data-i="${i}" data-dir="fwd" title="Trade ${r.fromCur} \u2192 ${r.toCur}" aria-label="Toggle ${r.fromCur} to ${r.toCur} direction">&rarr;</button>
           <button class="dir-btn ${r.rev === false ? "off" : "on"}" data-i="${i}" data-dir="rev" title="Trade ${r.toCur} \u2192 ${r.fromCur}" aria-label="Toggle ${r.toCur} to ${r.fromCur} direction">&larr;</button>
+          ${expandBtn}
           <button class="ratio-del" data-i="${i}" title="Remove" aria-label="Remove ratio">&times;</button>
         </span>
       </div>
       <div class="ratio-slider-row">
         <input type="range" data-i="${i}" min="0" max="${trim(max)}" step="0.1" value="${r.toAmount}" />
-        <span class="ratio-amount">${trim(r.toAmount)}${r.toCur}</span>
-      </div>`;
+        <span class="ratio-amount">${trim(r.toAmount)} ${r.toCur}</span>
+      </div>${revRow}`;
     ul.appendChild(li);
   });
 }
@@ -302,6 +382,15 @@ function renderConfig() {
 
 /** Compares the best path's output to trading the start currency directly for the goal. */
 function directComparisonHtml(goal, product) {
+  // Round-trip back to start: no meaningful "direct" comparison.
+  if (goal === state.start) {
+    const pct = (product - 1) * 100;
+    const cls = pct >= 1e-4 ? "good" : pct <= -1e-4 ? "bad" : "same";
+    return `<div class="path-compare">
+      <span class="cmp-direct">Round-trip via arbitrage</span>
+      <span class="cmp-badge ${cls}">${pct >= 0 ? "+" : ""}${trim(pct)}% net gain</span>
+    </div>`;
+  }
   const direct = directRate(state.start, goal);
   if (direct === null) {
     return `<div class="path-compare none">No direct ${state.start}&rarr;${goal} trade &mdash; only reachable via a path.</div>`;
@@ -309,14 +398,14 @@ function directComparisonHtml(goal, product) {
   const factor = product / direct;
   if (Math.abs(factor - 1) < 1e-6) {
     return `<div class="path-compare">
-      <span class="cmp-direct">Direct: 1${state.start} = ${trim(direct)}${goal}</span>
+      <span class="cmp-direct">Direct: 1 ${state.start} = ${trim(direct)} ${goal}</span>
       <span class="cmp-badge same">path = direct</span>
     </div>`;
   }
   const better = factor > 1;
   const pct = (factor - 1) * 100;
   return `<div class="path-compare">
-    <span class="cmp-direct">Direct: 1${state.start} = ${trim(direct)}${goal}</span>
+    <span class="cmp-direct">Direct: 1 ${state.start} = ${trim(direct)} ${goal}</span>
     <span class="cmp-badge ${better ? "good" : "bad"}">&times;${trim(factor)} ${better ? "better" : "worse"} via path (${pct >= 0 ? "+" : ""}${trim(pct)}%)</span>
   </div>`;
 }
@@ -412,7 +501,7 @@ function renderMispriced(refVals) {
     `<span class="under">underpriced</span> side beats trading directly.</p>` +
     mispriced.map((t) => `
       <div class="mispriced-row">
-        <span class="mp-trade">1<span class="cur">${t.from}</span> &rarr; ${trim(t.rate)}<span class="cur">${t.to}</span></span>
+        <span class="mp-trade">1 <span class="cur">${t.from}</span> &rarr; ${trim(t.rate)} <span class="cur">${t.to}</span></span>
         <span class="mp-note"><span class="cur">${t.to}</span> is <span class="under">underpriced</span> vs <span class="cur">${t.from}</span></span>
         <span class="mp-gain good">+${trim(t.gain * 100)}%</span>
       </div>`).join("") +
@@ -425,6 +514,7 @@ function renderResults() {
   renderHoldRanking(best, refVals);
   renderMispriced(refVals);
   renderCustomPath(best, refVals);
+  renderNetwork(refVals);
   const wrap = $("results");
   wrap.innerHTML = "";
 
@@ -440,12 +530,16 @@ function renderResults() {
     card.className = "path-card" + (res ? "" : " unreachable");
 
     if (!res) {
+      const sameAsStart = goal === state.start;
       card.innerHTML = `
         <div class="path-card-head">
           <span class="path-goal">&rarr; <span class="cur">${goal}</span></span>
           <span class="path-result bad">no path</span>
         </div>
-        <p class="no-path">No path from ${state.start} to ${goal} within ${state.maxLoops} loop(s).</p>`;
+        <p class="no-path">${sameAsStart
+          ? `No round-trip from <span class="cur">${state.start}</span> found — increase the loop budget to at least 1.`
+          : `No path from ${state.start} to ${goal} within ${state.maxLoops} loop(s).`
+        }</p>`;
       wrap.appendChild(card);
       paths.push({ goal, res: null });
       continue;
@@ -453,10 +547,11 @@ function renderResults() {
 
     const cls = res.product >= 1 ? "good" : "bad";
     const amt0 = startAmt();
+    const isLoop = goal === state.start;
     card.innerHTML = `
       <div class="path-card-head">
-        <span class="path-goal">&rarr; <span class="cur">${goal}</span></span>
-        <span class="path-result ${cls}">${trim(amt0)}${state.start} = ${trim(res.product * amt0)}${goal}</span>
+        <span class="path-goal">${isLoop ? "&#x21ba;" : "&rarr;"} <span class="cur">${goal}</span></span>
+        <span class="path-result ${cls}">${trim(amt0)} ${state.start} &rarr; ${trim(res.product * amt0)} ${goal}</span>
       </div>
       ${directComparisonHtml(goal, res.product)}`;
     wrap.appendChild(card);
@@ -551,10 +646,10 @@ function renderCustomPath(best, refVals) {
   card.innerHTML = `
     <div class="path-card-head">
       <span class="path-goal">&rarr; <span class="cur">${final}</span></span>
-      <span class="path-result ${cls}">${trim(amt0)}${start} = ${trim(product * amt0)}${final}</span>
+      <span class="path-result ${cls}">${trim(amt0)} ${start} = ${trim(product * amt0)} ${final}</span>
     </div>
     <div class="path-compare">
-      <span class="cmp-direct">Best path: ${trim(amt0)}${start} = ${bp ? trim(bp.product * amt0) : "\u2014"}${final}</span>
+      <span class="cmp-direct">Best path: ${trim(amt0)} ${start} = ${bp ? trim(bp.product * amt0) : "\u2014"} ${final}</span>
       ${cmp}
     </div>`;
   el.appendChild(card);
@@ -611,7 +706,7 @@ function renderPathSvg(res, W, refVals) {
     t.textContent = node;
     svg.appendChild(t);
     const amt = svgEl("text", { class: "step-amount", x, y: y + 38 });
-    amt.textContent = `${trim(amts[i])}${node}`;
+    amt.textContent = `${trim(amts[i])} ${node}`;
     svg.appendChild(amt);
   });
 
@@ -635,6 +730,114 @@ function arrowDefs() {
 /** Profitability chart: how much currency you hold after each trade, one line per goal.
  *  Re-rendered live as ratio sliders move. Fixed element sizes; width fills the panel. */
 const SERIES_COLORS = ["#e0bd63", "#6fb3d4", "#5cb874", "#d4634f", "#b08fe0", "#e0905a"];
+
+/** Network graph of currencies. Nodes laid out on a circle; each connected pair
+ *  drawn as an edge whose colour reflects how profitable its best direction is
+ *  versus the market reference (green = arbitrage gain, grey = fair, red = loss). */
+function renderNetwork(refVals) {
+  const svg = $("network");
+  const legend = $("network-legend");
+  if (!svg) return;
+  svg.innerHTML = "";
+  if (legend) legend.innerHTML = "";
+
+  const curs = currencies();
+  const W = Math.max(280, ($("network-wrap").clientWidth || 360) - 16);
+  const H = Math.min(Math.max(W * 0.72, 240), 420);
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  if (curs.length < 2) {
+    const t = svgEl("text", { class: "no-path-svg", x: W / 2, y: H / 2, "text-anchor": "middle" });
+    t.textContent = "Add ratios to see the currency network.";
+    svg.appendChild(t);
+    return;
+  }
+
+  // Circular layout
+  const cx = W / 2, cy = H / 2;
+  const radius = Math.min(W, H) / 2 - 46;
+  const pos = {};
+  curs.forEach((c, i) => {
+    const ang = -Math.PI / 2 + (i * 2 * Math.PI) / curs.length;
+    pos[c] = { x: cx + radius * Math.cos(ang), y: cy + radius * Math.sin(ang) };
+  });
+
+  // Best gain per undirected pair (favourable direction)
+  const adj = buildEdges();
+  const byPair = new Map();
+  for (const from of Object.keys(adj)) {
+    for (const e of adj[from]) {
+      const vFrom = refVals[from], vTo = refVals[e.to];
+      const gain = (vFrom != null && vTo != null && vFrom > 0 && vTo > 0)
+        ? (e.rate * vTo) / vFrom - 1 : null;
+      const key = [from, e.to].sort().join("|");
+      const prev = byPair.get(key);
+      if (!prev || (gain != null && (prev.gain == null || gain > prev.gain))) {
+        byPair.set(key, { from, to: e.to, rate: e.rate, gain });
+      }
+    }
+  }
+
+  const EPS = 1e-4;
+  // Gradual colour: interpolate from a neutral grey toward green (gain) or red
+  // (loss). A gain of ±20% reaches full saturation; smaller deltas stay muted.
+  const NEUTRAL = [122, 112, 92];   // --border-ish grey
+  const GREEN   = [92, 184, 116];   // --good
+  const RED     = [212, 99, 79];    // --bad
+  const lerp = (a, b, f) => Math.round(a + (b - a) * f);
+  const mix = (target, f) => `rgb(${lerp(NEUTRAL[0], target[0], f)}, ${lerp(NEUTRAL[1], target[1], f)}, ${lerp(NEUTRAL[2], target[2], f)})`;
+  const colorFor = (gain) => {
+    if (gain == null) return "var(--muted)";
+    const f = Math.min(Math.abs(gain) / 0.2, 1); // saturate at 20%
+    if (Math.abs(gain) <= EPS) return "var(--border)";
+    return mix(gain > 0 ? GREEN : RED, f);
+  };
+
+  // Edges (drawn first, under the nodes)
+  for (const t of byPair.values()) {
+    const a = pos[t.from], b = pos[t.to];
+    if (!a || !b) continue;
+    const mag = t.gain == null ? 0 : Math.min(Math.abs(t.gain), 0.5);
+    const line = svgEl("line", {
+      class: "net-edge", x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+      stroke: colorFor(t.gain), "stroke-width": 1.5 + mag * 8,
+    });
+    svg.appendChild(line);
+    // Gain label at midpoint for profitable/losing edges
+    if (t.gain != null && Math.abs(t.gain) > EPS) {
+      const lbl = svgEl("text", {
+        class: "net-edge-label", x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 4,
+        "text-anchor": "middle", fill: colorFor(t.gain),
+      });
+      lbl.textContent = `${t.gain >= 0 ? "+" : ""}${trim(t.gain * 100)}%`;
+      svg.appendChild(lbl);
+    }
+  }
+
+  // Nodes
+  for (const c of curs) {
+    const p = pos[c];
+    const isStart = c === state.start;
+    const isGoal = state.goals.includes(c);
+    svg.appendChild(svgEl("circle", {
+      class: `net-node${isStart ? " start" : ""}${isGoal ? " goal" : ""}`,
+      cx: p.x, cy: p.y, r: 20,
+    }));
+    const t = svgEl("text", { class: "net-node-label", x: p.x, y: p.y, "text-anchor": "middle", "dominant-baseline": "central" });
+    t.textContent = c;
+    svg.appendChild(t);
+  }
+
+  if (legend) {
+    legend.innerHTML =
+      `<span class="legend-item"><span class="legend-gradient loss"></span>loss</span>` +
+      `<span class="legend-item"><span class="legend-swatch" style="background:var(--border)"></span>fair</span>` +
+      `<span class="legend-item"><span class="legend-gradient gain"></span>profit</span>` +
+      `<span class="legend-item muted">stronger colour = bigger %</span>`;
+  }
+}
 
 function renderProfitChart(paths) {
   const svg = $("chart");
@@ -735,28 +938,53 @@ function renderProfitChart(paths) {
     const cls = s.product >= 1 ? "good" : "bad";
     item.innerHTML =
       `<span class="legend-swatch" style="background:${s.color}"></span>` +
-      `<span>&rarr;${s.goal}</span> <span class="legend-val ${cls}">${trim(startAmt())}${state.start} = ${trim(s.product * startAmt())}${s.goal}</span>`;
+      `<span>&rarr;${s.goal}</span> <span class="legend-val ${cls}">${trim(startAmt())} ${state.start} = ${trim(s.product * startAmt())} ${s.goal}</span>`;
     legend.appendChild(item);
   });
 }
 
-/** Shows a warning when some currencies are disconnected from the rest of the graph. */
+/** Shows warnings: red when the graph is split into disconnected groups,
+ *  yellow when connected currencies lack a direct ratio. */
 function renderWarning() {
-  const el = $("connectivity-warning");
+  const dangerEl = $("connectivity-warning");
+  const warnEl = $("missing-warning");
   const isolated = connectivityIssues();
-  if (isolated.length === 0) {
-    el.hidden = true;
-    el.textContent = "";
-    return;
+  const missing = missingDirectRatios();
+
+  // Red: disconnected components
+  if (isolated.length > 0) {
+    dangerEl.hidden = false;
+    dangerEl.innerHTML =
+      `\u26d4 ${isolated.length === 1 ? "Currency" : "Currencies"} ` +
+      `<strong>${isolated.join(", ")}</strong> ${isolated.length === 1 ? "has" : "have"} no ratio ` +
+      `connecting ${isolated.length === 1 ? "it" : "them"} to the rest \u2014 add a ratio to bridge the gap.`;
+  } else {
+    dangerEl.hidden = true;
+    dangerEl.textContent = "";
   }
-  el.hidden = false;
-  el.innerHTML =
-    `\u26a0 ${isolated.length === 1 ? "Currency" : "Currencies"} ` +
-    `<strong>${isolated.join(", ")}</strong> ${isolated.length === 1 ? "has" : "have"} no ratio ` +
-    `connecting ${isolated.length === 1 ? "it" : "them"} to the rest \u2014 add a ratio to bridge the gap.`;
+
+  // Yellow: connected but no direct ratio
+  if (missing.length > 0) {
+    const shown = missing.slice(0, 5);
+    const rest = missing.length - shown.length;
+    const chips = shown.map(({ from, to, rate }) => {
+      // Normalize so toAmount >= 1: swap direction if rate < 1
+      let bf = from, bt = to, br = rate;
+      if (isFinite(br) && br > 0 && br < 1) { bf = to; bt = from; br = 1 / br; }
+      const rateStr = isFinite(br) && br > 0 ? ` (~${trim(Math.round(br * 100) / 100)} per 1 ${bf})` : "";
+      return `<button class="add-missing-btn ghost-sm" data-from="${bf}" data-to="${bt}" data-rate="${isFinite(br) && br > 0 ? br : ""}">+ ${bf}↔${bt}${rateStr}</button>`;
+    }).join(" ");
+    const moreNote = rest > 0 ? ` <span class="muted">and ${rest} more</span>` : "";
+    warnEl.hidden = false;
+    warnEl.innerHTML = `\u26a0 No direct ratio for:${moreNote}<br>${chips}`;
+  } else {
+    warnEl.hidden = true;
+    warnEl.textContent = "";
+  }
 }
 
 function renderAll() {
+  state.ratios.sort((a, b) => a.fromCur.localeCompare(b.fromCur) || a.toCur.localeCompare(b.toCur));
   renderRatioList();
   renderConfig();
   renderWarning();
@@ -776,6 +1004,62 @@ window.addEventListener("resize", () => {
   clearTimeout(_resizeTimer);
   _resizeTimer = setTimeout(() => renderProfitChart(renderResults()), 100);
 });
+
+/* ------------------------------------------------------------------ *
+ * Resizable sidebar (drag handle between config and results panels)
+ * ------------------------------------------------------------------ */
+const SIDEBAR_KEY = "path-of-trading.sidebar-width";
+(function initResizer() {
+  const layout = document.querySelector(".layout");
+  const resizer = $("resizer");
+  if (!layout || !resizer) return;
+
+  const MIN = 300;
+  const apply = (px) => layout.style.setProperty("--sidebar-width", `${px}px`);
+
+  const saved = parseFloat(localStorage.getItem(SIDEBAR_KEY));
+  if (saved > 0) apply(saved);
+
+  const maxWidth = () => Math.max(MIN, layout.clientWidth - 360); // leave room for results
+  const curWidth = () => parseFloat(getComputedStyle(layout).getPropertyValue("--sidebar-width")) || 420;
+
+  let dragging = false;
+  let grabOffset = 0; // cursor X minus handle's left edge at grab time
+  const onMove = (e) => {
+    if (!dragging) return;
+    const left = layout.getBoundingClientRect().left + parseFloat(getComputedStyle(layout).paddingLeft);
+    apply(Math.min(Math.max(e.clientX - grabOffset - left, MIN), maxWidth()));
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("dragging");
+    document.body.style.userSelect = "";
+    localStorage.setItem(SIDEBAR_KEY, String(curWidth()));
+    renderProfitChart(renderResults());
+  };
+
+  resizer.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    grabOffset = e.clientX - resizer.getBoundingClientRect().left;
+    resizer.classList.add("dragging");
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", stop);
+
+  // keyboard accessibility: arrow keys nudge by 20px
+  resizer.addEventListener("keydown", (e) => {
+    const cur = curWidth();
+    if (e.key === "ArrowLeft") apply(Math.max(MIN, cur - 20));
+    else if (e.key === "ArrowRight") apply(Math.min(maxWidth(), cur + 20));
+    else return;
+    e.preventDefault();
+    localStorage.setItem(SIDEBAR_KEY, String(curWidth()));
+    renderProfitChart(renderResults());
+  });
+})();
 
 /* ------------------------------------------------------------------ *
  * Events
@@ -803,24 +1087,39 @@ $("ratio-list").addEventListener("input", (e) => {
   const r = state.ratios[i];
 
   if (el.type === "range") {
-    r.toAmount = +el.value;
-    item.querySelector('.amt-edit[data-side="to"]').value = trim(r.toAmount);
+    if (el.classList.contains("rev-slider")) {
+      r.revFromAmount = +el.value;
+      item.querySelector('.amt-edit[data-side="rev-from"]').value = trim(r.revFromAmount);
+      item.querySelector(".rev-amount").textContent = `${trim(r.revFromAmount)} ${r.toCur}`;
+      item.querySelector(".rev-rate").textContent = `(${trim((r.revToAmount || r.fromAmount) / r.revFromAmount)} per 1 ${r.toCur})`;
+    } else {
+      r.toAmount = +el.value;
+      item.querySelector('.amt-edit[data-side="to"]').value = trim(r.toAmount);
+    }
   } else if (el.classList.contains("amt-edit")) {
     const v = parseFloat(el.value);
     if (!(v > 0)) return; // ignore empty / non-positive while typing
     if (el.dataset.side === "from") {
       r.fromAmount = v;
-    } else {
+    } else if (el.dataset.side === "to") {
       r.toAmount = v;
-      item.querySelector('input[type="range"]').value = r.toAmount;
+      item.querySelector('input[type="range"]:not(.rev-slider)').value = r.toAmount;
+    } else if (el.dataset.side === "rev-from") {
+      r.revFromAmount = v;
+      const rs = item.querySelector(".rev-slider");
+      if (rs) rs.value = r.revFromAmount;
+    } else if (el.dataset.side === "rev-to") {
+      r.revToAmount = v;
+    } else {
+      return;
     }
   } else {
     return;
   }
 
   // refresh inline labels without a full re-render to preserve focus/caret
-  item.querySelector(".ratio-amount").textContent = `${trim(r.toAmount)}${r.toCur}`;
-  item.querySelector(".rate").textContent = `(${trim(r.toAmount / r.fromAmount)} per 1${r.fromCur})`;
+  item.querySelector(".ratio-amount").textContent = `${trim(r.toAmount)} ${r.toCur}`;
+  item.querySelector(".fwd-rate").textContent = `(${trim(r.toAmount / r.fromAmount)} per 1 ${r.fromCur})`;
   refreshLive();
 });
 
@@ -830,13 +1129,33 @@ $("ratio-list").addEventListener("change", (e) => {
 });
 
 $("ratio-list").addEventListener("click", (e) => {
+  // Expand/collapse custom reverse rate editor
+  const expandBtn = e.target.closest(".rev-expand-btn");
+  if (expandBtn) {
+    const r = state.ratios[+expandBtn.dataset.i];
+    r.revExpanded = !r.revExpanded;
+    if (r.revExpanded && !(r.revFromAmount > 0)) {
+      r.revFromAmount = r.toAmount;   // initialize to exact inverse
+      r.revToAmount   = r.fromAmount;
+    }
+    renderAll();
+    return;
+  }
+  // Reset custom reverse rate back to inverse
+  const resetBtn = e.target.closest(".rev-reset");
+  if (resetBtn) {
+    const r = state.ratios[+resetBtn.dataset.i];
+    delete r.revFromAmount;
+    delete r.revToAmount;
+    renderAll();
+    return;
+  }
   const dir = e.target.closest(".dir-btn");
   if (dir) {
     const r = state.ratios[+dir.dataset.i];
     const key = dir.dataset.dir; // "fwd" | "rev"
     const other = key === "fwd" ? "rev" : "fwd";
     const enabled = r[key] !== false;
-    if (enabled && r[other] === false) return; // keep at least one direction open
     r[key] = !enabled;
     renderAll();
     return;
@@ -900,6 +1219,52 @@ $("loops-slider").addEventListener("input", (e) => {
 $("reset-btn").addEventListener("click", () => {
   state = structuredClone(EXAMPLE);
   renderAll();
+});
+
+$("missing-warning").addEventListener("click", (e) => {
+  const btn = e.target.closest(".add-missing-btn");
+  if (!btn) return;
+  const from = btn.dataset.from, to = btn.dataset.to;
+  const rate = parseFloat(btn.dataset.rate);
+  // Normalise so fromAmount=1, round toAmount to 2 decimal places
+  const toAmount = isFinite(rate) && rate > 0 ? Math.round(rate * 100) / 100 : 1;
+  state.ratios.push({ fromAmount: 1, fromCur: from, toAmount, baseTo: toAmount, toCur: to, fwd: true, rev: true });
+  renderAll();
+});
+
+
+$("export-btn").addEventListener("click", () => {
+  const data = JSON.stringify({ ratios: state.ratios, start: state.start, goals: state.goals, maxLoops: state.maxLoops, startAmount: state.startAmount }, null, 2);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([data], { type: "application/json" }));
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  a.download = `path-of-trading-${ts}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$("import-btn").addEventListener("click", () => $("import-file").click());
+
+$("import-file").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    try {
+      const parsed = JSON.parse(ev.target.result);
+      if (!Array.isArray(parsed.ratios)) throw new Error("Missing ratios array");
+      state.ratios = parsed.ratios;
+      if (parsed.start) state.start = parsed.start;
+      if (Array.isArray(parsed.goals)) state.goals = parsed.goals;
+      if (parsed.maxLoops != null) state.maxLoops = +parsed.maxLoops;
+      if (parsed.startAmount > 0) state.startAmount = +parsed.startAmount;
+      renderAll();
+    } catch {
+      $("ratio-error").textContent = "Import failed: invalid JSON file.";
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = ""; // allow re-importing the same file
 });
 
 /* ------------------------------------------------------------------ *

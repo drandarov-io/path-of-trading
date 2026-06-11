@@ -13,7 +13,8 @@
   </header>
 
   <main class="layout">
-    <!-- LEFT: configuration -->
+    <!-- LEFT: configuration + network, stacked -->
+    <div class="sidebar">
     <section class="panel config">
       <h2>Currency ratios</h2>
       <form id="ratio-form" class="ratio-form" autocomplete="off">
@@ -28,14 +29,15 @@
       <p class="hint">Format: <code>1A -&gt; 20B</code> (amount + currency on each side)</p>
       <p id="ratio-error" class="error" role="alert"></p>
 
-      <p id="connectivity-warning" class="warning" role="status" hidden></p>
+      <p id="connectivity-warning" class="warning danger" role="alert" hidden></p>
+      <p id="missing-warning" class="warning" role="status" hidden></p>
 
       <ul id="ratio-list" class="ratio-list"></ul>
 
       <div class="config-grid">
         <div class="field">
           <label for="start-amount">Starting amount</label>
-          <input id="start-amount" type="number" min="0" step="0.1" value="1" />
+          <input id="start-amount" type="number" min="1" step="1" value="1" />
           <p class="hint">Amount of the start currency to simulate trading.</p>
         </div>
 
@@ -58,8 +60,26 @@
         </div>
       </div>
 
-      <button id="reset-btn" class="ghost" type="button">Reset to example</button>
+      <div class="bottom-actions">
+        <button id="reset-btn" class="ghost" type="button">Reset to example</button>
+        <button id="export-btn" class="ghost" type="button">Export</button>
+        <button id="import-btn" class="ghost" type="button">Import</button>
+        <input id="import-file" type="file" accept=".json" hidden />
+      </div>
     </section>
+
+    <!-- Currency network (own panel) -->
+    <section class="panel network">
+      <h2>Currency network</h2>
+      <div id="network-wrap" class="network-wrap">
+        <svg id="network"></svg>
+      </div>
+      <div id="network-legend" class="network-legend"></div>
+    </section>
+    </div>
+
+    <!-- DRAG HANDLE -->
+    <div id="resizer" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels" aria-valuenow="420" aria-valuemin="300" tabindex="0"></div>
 
     <!-- RIGHT: results -->
     <section class="panel results">
